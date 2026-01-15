@@ -1,0 +1,37 @@
+{
+  "name": "hono-uws",
+  "version": "0.1.0",
+  "description": "uWebSockets.js adapter for Hono",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/uws.d.ts",
+      "default": "./dist/uws.js"
+    }
+  },
+  "types": "./dist/uws.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test tests/basic.test.js",
+    "bench": "npm run build && node scripts/bench.mjs"
+  },
+  "dependencies": {
+    "uWebSockets.js": "github:uNetworking/uWebSockets.js#v20.51.0"
+  },
+  "peerDependencies": {
+    "hono": "^4.0.0"
+  },
+  "devDependencies": {
+    "hono": "^4.6.0",
+    "@hono/node-server": "^1.13.1",
+    "@types/node": "^20.11.30",
+    "autocannon": "^7.15.0",
+    "typescript": "^5.4.5"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
