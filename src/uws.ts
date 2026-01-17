@@ -48,12 +48,12 @@ export type WSHandler = (c: Context) => WSEvents | Promise<WSEvents>;
 interface WebSocketData {
   url: string;
   headers: [string, string][];
-  handler: WSHandler;
   events?: WSEvents;
   context?: Context;
 }
 
 // Store for WebSocket handlers registered via upgradeWebSocket
+// Path -> Handler mapping, populated when Hono middleware runs
 const wsHandlers = new Map<string, WSHandler>();
 
 /**
@@ -63,7 +63,7 @@ const wsHandlers = new Map<string, WSHandler>();
  * ```
  * const { upgradeWebSocket } = createUwsWebSocket();
  * 
- * app.get('/ws', upgradeWebSocket('/ws', (c) => ({
+ * app.get('/ws', upgradeWebSocket((c) => ({
  *   onOpen(event, ws) { ws.send('Welcome!'); },
  *   onMessage(event, ws) { ws.send(`Echo: ${event.data}`); },
  *   onClose() { console.log('Closed'); }
@@ -73,17 +73,17 @@ const wsHandlers = new Map<string, WSHandler>();
 export const createUwsWebSocket = (_options?: { app?: HonoLike }) => {
   /**
    * Middleware to upgrade HTTP connection to WebSocket
-   * @param path - The WebSocket endpoint path (must match the route path)
+   * Hono handles the path routing - no need to pass the path
    * @param handler - Function returning WebSocket event handlers
    */
-  const upgradeWebSocket = (path: string, handler: WSHandler) => {
-    // Register handler immediately so it's available when upgrade request comes
-    wsHandlers.set(path, handler);
-
-    // Return middleware that signals WebSocket upgrade
+  const upgradeWebSocket = (handler: WSHandler) => {
+    // Return middleware that signals WebSocket upgrade and registers handler
     return async (c: Context) => {
+      // Extract path from request URL and register handler
+      const url = new URL(c.req.url);
+      wsHandlers.set(url.pathname, handler);
+      
       // Return 101 to indicate this should be handled as WebSocket
-      // The actual upgrade is handled by uWS's .ws() handler
       return new Response(null, { status: 101, statusText: "Switching Protocols" });
     };
   };
@@ -492,7 +492,7 @@ export const createUwsServer = (
       })
     : uWS.App();
 
-  // WebSocket handler - upgrade requests for registered paths
+  // WebSocket handler - Hono handles routing
   uwsApp.ws<WebSocketData>("/*", {
     upgrade: (res, req, context) => {
       // Read request data synchronously (uWS invalidates req after callback)
@@ -502,14 +502,6 @@ export const createUwsServer = (
       const secWebSocketKey = req.getHeader("sec-websocket-key");
       const secWebSocketProtocol = req.getHeader("sec-websocket-protocol");
       const secWebSocketExtensions = req.getHeader("sec-websocket-extensions");
-
-      // Check if we have a handler registered for this path
-      const handler = wsHandlers.get(path);
-      if (!handler) {
-        // No WebSocket handler registered, reject upgrade
-        res.writeStatus("404 Not Found").end();
-        return;
-      }
 
       // Collect headers
       const headersData: [string, string][] = [];
@@ -521,12 +513,11 @@ export const createUwsServer = (
         ? `${protocol}://${host}${path}?${query}`
         : `${protocol}://${host}${path}`;
 
-      // Upgrade the connection with handler attached
+      // Upgrade all WebSocket connections - Hono will determine validity in open callback
       res.upgrade<WebSocketData>(
         {
           url: urlString,
           headers: headersData,
-          handler: handler,
         },
         secWebSocketKey,
         secWebSocketProtocol,
@@ -536,37 +527,58 @@ export const createUwsServer = (
     },
     open: async (ws) => {
       const data = ws.getUserData();
-      const handler = data.handler;
+      const url = new URL(data.url);
+      const path = url.pathname;
 
-      if (handler) {
-        try {
-          // Create a minimal Hono-like context for the handler
+      try {
+        // Check if handler already registered (from previous connection)
+        let handler = wsHandlers.get(path);
+
+        // If not registered, call Hono to trigger middleware and register handler
+        if (!handler) {
           const request = createLazyRequest("GET", data.url, data.headers, null);
-          const mockContext = {
-            req: {
-              url: data.url,
-              header: (name: string) => {
-                const found = data.headers.find(
-                  ([k]) => k.toLowerCase() === name.toLowerCase()
-                );
-                return found?.[1];
-              },
-              raw: request,
-            },
-          } as unknown as Context;
+          const response = await app.fetch(request);
 
-          const events = await handler(mockContext);
-          data.events = events;
-          data.context = mockContext;
-
-          if (events.onOpen) {
-            const wsContext = createWSContext(ws);
-            events.onOpen(new Event("open"), wsContext);
+          // Check if Hono returned 101 (WebSocket route)
+          if (response.status !== 101) {
+            ws.end(1008, "Not Found");
+            return;
           }
-        } catch (error) {
-          console.error("WebSocket handler error:", error);
-          ws.end(1011, "Internal Error");
+
+          // Handler should now be registered by the middleware
+          handler = wsHandlers.get(path);
+          if (!handler) {
+            ws.end(1008, "Not Found");
+            return;
+          }
         }
+
+        // Create a minimal Hono-like context for the handler
+        const request = createLazyRequest("GET", data.url, data.headers, null);
+        const mockContext = {
+          req: {
+            url: data.url,
+            header: (name: string) => {
+              const found = data.headers.find(
+                ([k]) => k.toLowerCase() === name.toLowerCase()
+              );
+              return found?.[1];
+            },
+            raw: request,
+          },
+        } as unknown as Context;
+
+        const events = await handler(mockContext);
+        data.events = events;
+        data.context = mockContext;
+
+        if (events.onOpen) {
+          const wsContext = createWSContext(ws);
+          events.onOpen(new Event("open"), wsContext);
+        }
+      } catch (error) {
+        console.error("WebSocket handler error:", error);
+        ws.end(1011, "Internal Error");
       }
     },
     message: (ws, message, isBinary) => {

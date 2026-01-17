@@ -12,10 +12,10 @@ app.get("/", (c) => {
 });
 
 // WebSocket route - echo server
-// Note: path must be passed to upgradeWebSocket() and must match the route path
+// Hono handles the routing - no need to pass the path
 app.get(
   "/ws",
-  upgradeWebSocket("/ws", (c) => {
+  upgradeWebSocket((c) => {
     console.log("WebSocket handler called for:", c.req.url);
 
     return {
@@ -46,7 +46,7 @@ const clients = new Set();
 
 app.get(
   "/chat",
-  upgradeWebSocket("/chat", (c) => {
+  upgradeWebSocket((c) => {
     let wsContext;
 
     return {
