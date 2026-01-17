@@ -3,6 +3,110 @@ type HonoLike = {
   fetch: (request: Request) => Response | Promise<Response>;
 };
 import uWS from "uWebSockets.js";
+import type { Context } from "hono";
+
+// ============================================================================
+// CloseEvent Polyfill (not available in Node.js)
+// ============================================================================
+
+class CloseEvent extends Event {
+  readonly code: number;
+  readonly reason: string;
+  readonly wasClean: boolean;
+
+  constructor(type: string, init?: { code?: number; reason?: string; wasClean?: boolean }) {
+    super(type);
+    this.code = init?.code ?? 1000;
+    this.reason = init?.reason ?? "";
+    this.wasClean = init?.wasClean ?? true;
+  }
+}
+
+// ============================================================================
+// WebSocket Types and Implementation
+// ============================================================================
+
+export interface WSContext {
+  send(
+    data: string | ArrayBuffer | Uint8Array,
+    isBinary?: boolean,
+    compress?: boolean
+  ): void;
+  close(code?: number, reason?: string): void;
+  getRaw(): uWS.WebSocket<WebSocketData>;
+}
+
+export interface WSEvents {
+  onOpen?: (event: Event, ws: WSContext) => void;
+  onMessage?: (event: MessageEvent, ws: WSContext) => void;
+  onClose?: (event: CloseEvent, ws: WSContext) => void;
+  onError?: (event: Event, ws: WSContext) => void;
+}
+
+export type WSHandler = (c: Context) => WSEvents | Promise<WSEvents>;
+
+interface WebSocketData {
+  url: string;
+  headers: [string, string][];
+  handler: WSHandler;
+  events?: WSEvents;
+  context?: Context;
+}
+
+// Store for WebSocket handlers registered via upgradeWebSocket
+const wsHandlers = new Map<string, WSHandler>();
+
+/**
+ * Create WebSocket helpers for use with Hono and uWebSockets.js
+ * 
+ * Usage:
+ * ```
+ * const { upgradeWebSocket } = createUwsWebSocket();
+ * 
+ * app.get('/ws', upgradeWebSocket('/ws', (c) => ({
+ *   onOpen(event, ws) { ws.send('Welcome!'); },
+ *   onMessage(event, ws) { ws.send(`Echo: ${event.data}`); },
+ *   onClose() { console.log('Closed'); }
+ * })));
+ * ```
+ */
+export const createUwsWebSocket = (_options?: { app?: HonoLike }) => {
+  /**
+   * Middleware to upgrade HTTP connection to WebSocket
+   * @param path - The WebSocket endpoint path (must match the route path)
+   * @param handler - Function returning WebSocket event handlers
+   */
+  const upgradeWebSocket = (path: string, handler: WSHandler) => {
+    // Register handler immediately so it's available when upgrade request comes
+    wsHandlers.set(path, handler);
+
+    // Return middleware that signals WebSocket upgrade
+    return async (c: Context) => {
+      // Return 101 to indicate this should be handled as WebSocket
+      // The actual upgrade is handled by uWS's .ws() handler
+      return new Response(null, { status: 101, statusText: "Switching Protocols" });
+    };
+  };
+
+  return { upgradeWebSocket };
+};
+
+// Create WSContext wrapper for uWS WebSocket
+const createWSContext = (ws: uWS.WebSocket<WebSocketData>): WSContext => ({
+  send(
+    data: string | ArrayBuffer | Uint8Array,
+    isBinary = false,
+    compress = false
+  ) {
+    ws.send(data, isBinary, compress);
+  },
+  close(code?: number, reason?: string) {
+    ws.end(code, reason);
+  },
+  getRaw() {
+    return ws;
+  },
+});
 
 // ============================================================================
 // Lightweight Response Implementation (inspired by @hono/node-server)
@@ -384,6 +488,107 @@ export const createUwsServer = (
         ca_file_name: options.ca?.file_name,
       })
     : uWS.App();
+
+  // WebSocket handler - upgrade requests for registered paths
+  uwsApp.ws<WebSocketData>("/*", {
+    upgrade: (res, req, context) => {
+      // Read request data synchronously (uWS invalidates req after callback)
+      const path = req.getUrl();
+      const query = req.getQuery();
+      const host = req.getHeader("host");
+      const secWebSocketKey = req.getHeader("sec-websocket-key");
+      const secWebSocketProtocol = req.getHeader("sec-websocket-protocol");
+      const secWebSocketExtensions = req.getHeader("sec-websocket-extensions");
+
+      // Check if we have a handler registered for this path
+      const handler = wsHandlers.get(path);
+      if (!handler) {
+        // No WebSocket handler registered, reject upgrade
+        res.writeStatus("404 Not Found").end();
+        return;
+      }
+
+      // Collect headers
+      const headersData: [string, string][] = [];
+      req.forEach((name, value) => {
+        headersData.push([name, value]);
+      });
+
+      const urlString = query
+        ? `${protocol}://${host}${path}?${query}`
+        : `${protocol}://${host}${path}`;
+
+      // Upgrade the connection with handler attached
+      res.upgrade<WebSocketData>(
+        {
+          url: urlString,
+          headers: headersData,
+          handler: handler,
+        },
+        secWebSocketKey,
+        secWebSocketProtocol,
+        secWebSocketExtensions,
+        context
+      );
+    },
+    open: async (ws) => {
+      const data = ws.getUserData();
+      const handler = data.handler;
+
+      if (handler) {
+        try {
+          // Create a minimal Hono-like context for the handler
+          const request = createLazyRequest("GET", data.url, data.headers, null);
+          const mockContext = {
+            req: {
+              url: data.url,
+              header: (name: string) => {
+                const found = data.headers.find(
+                  ([k]) => k.toLowerCase() === name.toLowerCase()
+                );
+                return found?.[1];
+              },
+              raw: request,
+            },
+          } as unknown as Context;
+
+          const events = await handler(mockContext);
+          data.events = events;
+          data.context = mockContext;
+
+          if (events.onOpen) {
+            const wsContext = createWSContext(ws);
+            events.onOpen(new Event("open"), wsContext);
+          }
+        } catch (error) {
+          console.error("WebSocket handler error:", error);
+          ws.end(1011, "Internal Error");
+        }
+      }
+    },
+    message: (ws, message, isBinary) => {
+      const data = ws.getUserData();
+      if (data.events?.onMessage) {
+        const wsContext = createWSContext(ws);
+        const messageData = isBinary
+          ? new Uint8Array(message)
+          : new TextDecoder().decode(message);
+        const event = new MessageEvent("message", { data: messageData });
+        data.events.onMessage(event, wsContext);
+      }
+    },
+    close: (ws, code, message) => {
+      const data = ws.getUserData();
+      if (data.events?.onClose) {
+        const wsContext = createWSContext(ws);
+        const reason = message
+          ? new TextDecoder().decode(new Uint8Array(message))
+          : "";
+        const event = new CloseEvent("close", { code, reason });
+        data.events.onClose(event, wsContext);
+      }
+    },
+  });
 
   uwsApp.any("/*", (res: uWS.HttpResponse, req: uWS.HttpRequest) => {
     // Read all request data synchronously before any async operations
