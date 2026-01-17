@@ -139,7 +139,10 @@ class LightweightResponse {
     this.#init = init;
 
     // Cache simple response types for fast access
+    // Also cache null body responses (e.g., 101 Switching Protocols for WebSocket)
     if (
+      body === null ||
+      body === undefined ||
       typeof body === "string" ||
       typeof (body as ReadableStream | undefined)?.getReader !== "undefined" ||
       body instanceof Blob ||
@@ -155,11 +158,11 @@ class LightweightResponse {
           headers = init.headers as Record<string, string>;
         }
       } else {
-        headers = { "content-type": "text/plain; charset=UTF-8" };
+        headers = {};
       }
       this[cacheKey] = [
         init?.status || 200,
-        body as string | ReadableStream | Blob | Uint8Array,
+        (body ?? "") as string | ReadableStream | Blob | Uint8Array,
         headers,
       ];
     }
