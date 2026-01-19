@@ -23,38 +23,48 @@ class CloseEvent extends Event {
 }
 
 // ============================================================================
-// WebSocket Types and Implementation
+// WebSocket Types and Implementation (Hono-compatible)
 // ============================================================================
 
-export interface WSContext {
+export interface WSContext<T = unknown> {
   send(
     data: string | ArrayBuffer | Uint8Array,
-    isBinary?: boolean,
-    compress?: boolean
+    options?: { compress?: boolean }
   ): void;
   close(code?: number, reason?: string): void;
-  getRaw(): uWS.WebSocket<WebSocketData>;
+  raw: uWS.WebSocket<WebSocketData>;
+  binaryType: "arraybuffer" | "blob";
+  readyState: number;
+  url: URL | null;
+  protocol: string | null;
 }
 
-export interface WSEvents {
-  onOpen?: (event: Event, ws: WSContext) => void;
-  onMessage?: (event: MessageEvent, ws: WSContext) => void;
-  onClose?: (event: CloseEvent, ws: WSContext) => void;
-  onError?: (event: Event, ws: WSContext) => void;
+export interface WSEvents<T = unknown> {
+  onOpen?: (evt: Event, ws: WSContext<T>) => void;
+  onMessage?: (evt: MessageEvent<WSMessageReceive>, ws: WSContext<T>) => void;
+  onClose?: (evt: CloseEvent, ws: WSContext<T>) => void;
+  onError?: (evt: Event, ws: WSContext<T>) => void;
 }
 
-export type WSHandler = (c: Context) => WSEvents | Promise<WSEvents>;
+export type WSMessageReceive = string | Blob | ArrayBufferLike | Uint8Array;
+
+export type UpgradeWebSocket<T = unknown, U = unknown> = (
+  handler: (c: Context) => WSEvents<T> | Promise<WSEvents<T>>,
+  options?: U
+) => (c: Context) => Response | Promise<Response>;
+
+type WSHandler<T = unknown> = (c: Context) => WSEvents<T> | Promise<WSEvents<T>>;
 
 interface WebSocketData {
   url: string;
   headers: [string, string][];
-  events?: WSEvents;
+  events?: WSEvents<unknown>;
   context?: Context;
 }
 
 // Store for WebSocket handlers registered via upgradeWebSocket
 // Path -> Handler mapping, populated when Hono middleware runs
-const wsHandlers = new Map<string, WSHandler>();
+const wsHandlers = new Map<string, WSHandler<unknown>>();
 
 /**
  * Create WebSocket helpers for use with Hono and uWebSockets.js
@@ -70,18 +80,20 @@ const wsHandlers = new Map<string, WSHandler>();
  * })));
  * ```
  */
-export const createUwsWebSocket = (_options?: { app?: HonoLike }) => {
+export const createUwsWebSocket = <T = unknown>(_options?: { app?: HonoLike }): {
+  upgradeWebSocket: UpgradeWebSocket<T>;
+} => {
   /**
    * Middleware to upgrade HTTP connection to WebSocket
    * Hono handles the path routing - no need to pass the path
    * @param handler - Function returning WebSocket event handlers
    */
-  const upgradeWebSocket = (handler: WSHandler) => {
+  const upgradeWebSocket: UpgradeWebSocket<T> = (handler) => {
     // Return middleware that signals WebSocket upgrade and registers handler
     return async (c: Context) => {
       // Extract path from request URL and register handler
       const url = new URL(c.req.url);
-      wsHandlers.set(url.pathname, handler);
+      wsHandlers.set(url.pathname, handler as WSHandler<unknown>);
       
       // Return 101 to indicate this should be handled as WebSocket
       return new Response(null, { status: 101, statusText: "Switching Protocols" });
@@ -92,21 +104,32 @@ export const createUwsWebSocket = (_options?: { app?: HonoLike }) => {
 };
 
 // Create WSContext wrapper for uWS WebSocket
-const createWSContext = (ws: uWS.WebSocket<WebSocketData>): WSContext => ({
-  send(
-    data: string | ArrayBuffer | Uint8Array,
-    isBinary = false,
-    compress = false
-  ) {
-    ws.send(data, isBinary, compress);
-  },
-  close(code?: number, reason?: string) {
-    ws.end(code, reason);
-  },
-  getRaw() {
-    return ws;
-  },
-});
+const createWSContext = <T = unknown>(
+  ws: uWS.WebSocket<WebSocketData>,
+  urlString: string
+): WSContext<T> => {
+  let parsedUrl: URL | null = null;
+  try {
+    parsedUrl = new URL(urlString);
+  } catch {
+    // Invalid URL, leave as null
+  }
+
+  return {
+    send(data: string | ArrayBuffer | Uint8Array, options?: { compress?: boolean }) {
+      const isBinary = data instanceof ArrayBuffer || data instanceof Uint8Array;
+      ws.send(data, isBinary, options?.compress ?? false);
+    },
+    close(code?: number, reason?: string) {
+      ws.end(code, reason);
+    },
+    raw: ws,
+    binaryType: "arraybuffer",
+    readyState: 1, // WebSocket.OPEN
+    url: parsedUrl,
+    protocol: null,
+  };
+};
 
 // ============================================================================
 // Lightweight Response Implementation (inspired by @hono/node-server)
@@ -573,7 +596,7 @@ export const createUwsServer = (
         data.context = mockContext;
 
         if (events.onOpen) {
-          const wsContext = createWSContext(ws);
+          const wsContext = createWSContext(ws, data.url);
           events.onOpen(new Event("open"), wsContext);
         }
       } catch (error) {
@@ -584,7 +607,7 @@ export const createUwsServer = (
     message: (ws, message, isBinary) => {
       const data = ws.getUserData();
       if (data.events?.onMessage) {
-        const wsContext = createWSContext(ws);
+        const wsContext = createWSContext(ws, data.url);
         const messageData = isBinary
           ? new Uint8Array(message)
           : new TextDecoder().decode(message);
@@ -595,7 +618,7 @@ export const createUwsServer = (
     close: (ws, code, message) => {
       const data = ws.getUserData();
       if (data.events?.onClose) {
-        const wsContext = createWSContext(ws);
+        const wsContext = createWSContext(ws, data.url);
         const reason = message
           ? new TextDecoder().decode(new Uint8Array(message))
           : "";
